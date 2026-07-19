@@ -15,6 +15,10 @@
 #include <algorithm>
 #include <cstring>
 #include <sys/stat.h>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <unordered_map>
 
 namespace fs = std::filesystem;
 
@@ -88,6 +92,7 @@ static bool file_browser_ui(notcurses* nc, struct ncplane* parent,
         closedir(d);
     }
     std::sort(files.begin(), files.end());
+    files.insert(files.begin(), "( new file )");
 
     unsigned int term_y, term_x;
     notcurses_term_dim_yx(nc, &term_y, &term_x);
@@ -181,6 +186,7 @@ static bool file_browser_ui(notcurses* nc, struct ncplane* parent,
             if (!files.empty() && sel < (int)files.size()) {
                 selected = files[sel];
                 result = true;
+                if (sel == 0) selected.clear(); // signal "new file"
             }
             done = true;
         } else if (key == NCKEY_UP) {
@@ -195,284 +201,619 @@ static bool file_browser_ui(notcurses* nc, struct ncplane* parent,
     return result;
 }
 
-// ── Run brainfuck program ──────────────────────────────────────────
-// Saves code to temp file, forks interpreter with file path arg
-static void run_program(notcurses* nc, struct ncplane* plane,
-                         const std::string& code) {
-    // Save to temp file in programs_dir
-    std::string tmp_path = programs_dir + "/_tmp_editor_run.bf";
-    {
-        std::ofstream f(tmp_path);
-        f << code;
+// ── ASCII label for tape display (raw unsigned char) ────────────
+static const char* ascii_label(unsigned char c) {
+    static char lbl[2] = {0};
+    lbl[0] = (char)c;
+    return lbl;
+}
+
+// ── History entry for undo/redo ────────────────────────────────
+struct HistoryEntry {
+    int ip, ptr, cell;
+    unsigned char old_val, new_val;
+};
+
+// ── Shared state between UI and interpreter thread ──────────────
+struct BFState {
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::string output;
+    std::unordered_map<int, unsigned char> tape;
+    int ptr = 0;
+    bool needs_input = false;
+    unsigned char input_val = 0;
+    bool input_ready = false;
+    bool running = true;
+    bool finished = false;
+    std::string error;
+    int wait_ms = 100;
+    // Debug features
+    bool paused = false;
+    bool recording = false;
+    static constexpr int MAX_HISTORY = 100000;
+    std::vector<HistoryEntry> history;
+    std::string input_buffer;
+    bool input_done = false;
+};
+
+// ── Interpreter thread (runs BF code, signals for , input) ──────
+static void bf_interp_thread(const std::string& code, BFState& state) {
+    std::unordered_map<int, int> jumps;
+    std::vector<int> stack;
+    for (int i = 0; i < (int)code.size(); i++) {
+        if (code[i] == '[') stack.push_back(i);
+        else if (code[i] == ']') {
+            if (stack.empty()) {
+                {
+                    std::lock_guard<std::mutex> lk(state.mtx);
+                    state.error = "Unmatched ] at " + std::to_string(i);
+                    state.finished = true;
+                    state.running = false;
+                }
+                state.cv.notify_one();
+                return;
+            }
+            int j = stack.back(); stack.pop_back();
+            jumps[j] = i; jumps[i] = j;
+        }
     }
-
-    // List of interpreters to try (all accept <file.bf> arg now)
-    struct Interp {
-        std::string cmd;
-        std::string arg;
-    };
-
-    std::vector<Interp> interps;
-    interps.push_back({"brainfuck", tmp_path});
-
-    struct stat st;
-    std::string bfw_path = base_dir + "/bfw";
-    if (stat(bfw_path.c_str(), &st) == 0 && (st.st_mode & S_IXUSR))
-        interps.push_back({bfw_path, tmp_path});
-    std::string bfs_path = base_dir + "/bfs";
-    if (stat(bfs_path.c_str(), &st) == 0 && (st.st_mode & S_IXUSR))
-        interps.push_back({bfs_path, tmp_path});
-    std::string bff_path = base_dir + "/bff";
-    if (stat(bff_path.c_str(), &st) == 0 && (st.st_mode & S_IXUSR))
-        interps.push_back({bff_path, tmp_path});
-
-    if (interps.empty()) {
-        ncplane_set_fg_rgb(plane, 0xff4444);
-        ncplane_putstr_yx(plane, 0, 0, "No brainfuck interpreter found!");
-        notcurses_render(nc);
-        struct timespec ts = { .tv_sec = 2, .tv_nsec = 0 };
-        nanosleep(&ts, nullptr);
+    if (!stack.empty()) {
+        {
+            std::lock_guard<std::mutex> lk(state.mtx);
+            state.error = "Unmatched [ at " + std::to_string(stack.back());
+            state.finished = true;
+            state.running = false;
+        }
+        state.cv.notify_one();
         return;
     }
 
-    std::string output_path = base_dir + "/output.txt";
+    int p = 0, ip = 0;
+    { std::lock_guard<std::mutex> lk(state.mtx); state.ptr = p; }
+    while (ip < (int)code.size()) {
+        // ── Check control signals under lock ──
+        {
+            std::unique_lock<std::mutex> lk(state.mtx);
+            // Wait if paused (re-check on cv notify)
+            while (state.paused && state.running)
+                state.cv.wait(lk);
+            if (!state.running) break;
+            state.ptr = p;
+        }
 
-    // ── Create output plane ────────────────────────────────────────
-    unsigned int term_y_u, term_x_u;
-    notcurses_term_dim_yx(nc, &term_y_u, &term_x_u);
+        char c = code[ip];
+
+        // ── Save history entry (BEFORE execution, only when recording) ──
+        bool did_push = false;
+        if (state.recording) {
+            std::lock_guard<std::mutex> lk(state.mtx);
+            unsigned char old_val = c == '+' ? state.tape[p] :
+                                  c == '-' ? state.tape[p] :
+                                  c == ',' ? state.tape[p] : 0;
+            if ((int)state.history.size() < BFState::MAX_HISTORY) {
+                state.history.push_back({ip, p,
+                    (c == '+' || c == '-' || c == ',') ? p : -1,
+                    old_val, 0});
+                did_push = true;
+            }
+        }
+
+        // ── Execute instruction ──
+        if (c == '>') { p++; }
+        else if (c == '<') { p--; }
+        else if (c == '+') {
+            std::lock_guard<std::mutex> lk(state.mtx);
+            state.tape[p]++;
+            if (did_push) state.history.back().new_val = state.tape[p];
+        } else if (c == '-') {
+            std::lock_guard<std::mutex> lk(state.mtx);
+            state.tape[p]--;
+            if (did_push) state.history.back().new_val = state.tape[p];
+        } else if (c == '.') {
+            {
+                std::lock_guard<std::mutex> lk(state.mtx);
+                state.output += (char)state.tape[p];
+            }
+            state.cv.notify_one();
+        } else if (c == ',') {
+            std::unique_lock<std::mutex> lk(state.mtx);
+            // Read from input buffer; show dialog if empty
+            while (state.input_buffer.empty() && state.running) {
+                state.needs_input = true;
+                state.input_done = false;
+                lk.unlock();
+                state.cv.notify_one();
+                lk.lock();
+                state.cv.wait(lk, [&]{ return state.input_done || !state.running; });
+            }
+            if (!state.running) return;
+            state.tape[p] = (unsigned char)state.input_buffer[0];
+            if (did_push) state.history.back().new_val = state.tape[p];
+            state.input_buffer.erase(state.input_buffer.begin());
+            state.needs_input = false; // only set true when actually waiting
+        } else if (c == '[') {
+            unsigned char val;
+            { std::lock_guard<std::mutex> lk(state.mtx);
+              auto it = state.tape.find(p);
+              val = (it != state.tape.end()) ? it->second : 0; }
+            if (val == 0) ip = jumps[ip];
+        } else if (c == ']') {
+            unsigned char val;
+            { std::lock_guard<std::mutex> lk(state.mtx);
+              auto it = state.tape.find(p);
+              val = (it != state.tape.end()) ? it->second : 0; }
+            if (val != 0) ip = jumps[ip];
+        }
+        ip++;
+
+        // ── Sleep after instruction ──
+        int wm;
+        {
+            std::lock_guard<std::mutex> lk(state.mtx);
+            state.ptr = p;
+            wm = state.wait_ms;
+        }
+        if (wm > 0) {
+            struct timespec ts = {.tv_sec = wm / 1000, .tv_nsec = (wm % 1000) * 1000000};
+            nanosleep(&ts, nullptr);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(state.mtx);
+        state.finished = true;
+        state.running = false;
+    }
+    state.cv.notify_one();
+}
+
+// ── Run brainfuck program (in-process with tape display) ─────────
+static void run_program(notcurses* nc, struct ncplane* plane,
+                         const std::string& code) {
+    unsigned int term_y, term_x;
+    notcurses_term_dim_yx(nc, &term_y, &term_x);
+
+    // ── Overlay plane ───────────────────────────────────────────────
     struct ncplane_options nopts = {};
-    nopts.y = 0;
-    nopts.x = 0;
-    nopts.rows = (int)term_y_u;
-    nopts.cols = (int)term_x_u;
+    nopts.y = 0; nopts.x = 0;
+    nopts.rows = (int)term_y; nopts.cols = (int)term_x;
     struct ncplane* run_plane = ncplane_create(notcurses_stdplane(nc), &nopts);
     if (!run_plane) return;
     uint64_t bgch = 0;
     ncchannels_set_bg_rgb(&bgch, 0x111111);
     ncplane_set_base(run_plane, " ", 0, bgch);
 
-    int output_row = 2;
-    int output_col = 1;
-    int scroll_top = 0;
-    int scroll_left = 0;
-    std::string captured_output;
-    bool ran = false;
-    bool aborted = false;
+    const int TAPE_W = 11;
+    int tape_col = (int)term_x - TAPE_W;
+    if (tape_col < 15) tape_col = 15;
 
-    // Line-scan helpers
-    auto count_lines = [&]() -> int {
-        if (captured_output.empty()) return 0;
-        int n = 1;
-        for (auto c : captured_output) if (c == '\n') n++;
-        return n;
-    };
-    auto get_line = [&](int line_num, int& start, int& len) -> bool {
-        int cur = 0; start = 0;
-        for (size_t i = 0; i < captured_output.size(); i++) {
-            if (captured_output[i] == '\n') {
-                if (cur == line_num) { len = (int)i - start; return true; }
-                cur++; start = (int)i + 1;
+    // ── Spawn interpreter thread ────────────────────────────────────
+    BFState state;
+    std::thread interp(bf_interp_thread, std::ref(code), std::ref(state));
+
+    // ── Render state ────────────────────────────────────────────────
+    int scroll_top = 0, scroll_left = 0;
+    bool follow_bottom = true;
+    bool done = false;
+    std::string cached_out;
+    int display_pos = -1; // -1 = live, else index into state.history
+    std::unordered_map<int, unsigned char> display_tape;
+    int display_ptr = 0;
+
+    while (!done) {
+        // ── Snapshot shared state ──
+        bool input_needed, finished, has_error;
+        int cur_ptr;
+        std::unordered_map<int, unsigned char> tape_snap;
+        std::string err_msg;
+        {
+            std::lock_guard<std::mutex> lk(state.mtx);
+            cached_out = state.output;
+            input_needed = state.needs_input;
+            finished = state.finished;
+            cur_ptr = state.ptr;
+            // Only snapshot cells visible in tape column
+            int tape_cells_snap = (int)term_y - 2;
+            int mid = tape_cells_snap / 2;
+            int first = (cur_ptr < mid) ? 0 : cur_ptr - mid;
+            for (int i = 0; i < tape_cells_snap; i++) {
+                int idx = first + i;
+                auto it = state.tape.find(idx);
+                if (it != state.tape.end()) tape_snap[idx] = it->second;
             }
+            has_error = !state.error.empty();
+            err_msg = state.error;
         }
-        if (cur == line_num) { len = (int)captured_output.size() - start; return true; }
-        return false;
-    };
 
-    // Render current output onto run_plane
-    auto render_output = [&](const std::string& bottom_text) {
+        // Override with historical state if viewing history
+        if (display_pos >= 0) {
+            cur_ptr = display_ptr;
+            tape_snap = display_tape;
+        }
+
+        // ── Render frame ──
         ncplane_erase(run_plane);
+
+        int vis_rows = (int)term_y - 2;
+        int out_w = tape_col - 2;
+
         // Title
-        ncplane_set_fg_rgb(run_plane, 0xffffff);
         ncplane_set_bg_rgb(run_plane, 0x335577);
+        ncplane_set_fg_rgb(run_plane, 0xffffff);
         ncplane_putstr_yx(run_plane, 0, 1, " Program Output ");
-        for (int x = 17; x < (int)term_x_u - 1; x++)
+        for (int x = 17; x < (int)term_x - 1; x++)
             ncplane_putchar_yx(run_plane, 0, x, ' ');
 
-        int vis_rows = (int)term_y_u - output_row - 1;
-        int vis_cols = (int)term_x_u - output_col - 1;
-        int total = count_lines();
-        if (scroll_top > total - vis_rows) scroll_top = total - vis_rows;
-        if (scroll_top < 0) scroll_top = 0;
+        // ── Output text ──
+        std::vector<int> line_starts = {0};
+        for (int i = 0; i < (int)cached_out.size(); i++)
+            if (cached_out[i] == '\n') line_starts.push_back(i + 1);
+        int total_lines = (int)line_starts.size();
 
-        // Find longest line in entire output to clamp scroll_left
-        int max_width = 0;
-        for (int i = 0; i < total; i++) {
-            int s = 0, l = 0;
-            if (get_line(i, s, l) && l > max_width) max_width = l;
+        int max_w = 0;
+        for (int i = 0; i < total_lines; i++) {
+            int end = (i + 1 < total_lines) ? line_starts[i+1] - 1 : (int)cached_out.size();
+            int w = end - line_starts[i];
+            if (w > max_w) max_w = w;
         }
-        int max_scroll = max_width - vis_cols;
-        if (max_scroll < 0) max_scroll = 0;
-        if (scroll_left > max_scroll) scroll_left = max_scroll;
+        int max_scroll_v = total_lines - vis_rows;
+        if (max_scroll_v < 0) max_scroll_v = 0;
+        int max_scroll_h = max_w - out_w;
+        if (max_scroll_h < 0) max_scroll_h = 0;
+        if (scroll_top > max_scroll_v) scroll_top = max_scroll_v;
+        if (scroll_top < 0) scroll_top = 0;
+        if (scroll_left > max_scroll_h) scroll_left = max_scroll_h;
         if (scroll_left < 0) scroll_left = 0;
+
+        // Auto-scroll to bottom if following
+        if (follow_bottom) scroll_top = max_scroll_v;
 
         ncplane_set_fg_rgb(run_plane, 0xf0f0f0);
         ncplane_set_bg_rgb(run_plane, 0x111111);
-        int r = 0;
-        for (int line = scroll_top; line < total && r < vis_rows; line++) {
-            int start = 0, len = 0;
-            if (!get_line(line, start, len)) break;
+        for (int r = 0; r < vis_rows && scroll_top + r < total_lines; r++) {
+            int li = scroll_top + r;
+            int s = line_starts[li];
+            int e = (li + 1 < total_lines) ? line_starts[li+1] - 1 : (int)cached_out.size();
             int c = 0;
-            for (int i = scroll_left; i < len && c < vis_cols; i++) {
-                char ch = captured_output[start + i];
+            for (int i = s + scroll_left; i < e && c < out_w; i++) {
+                char ch = cached_out[i];
                 if (ch >= 32) {
-                    ncplane_putchar_yx(run_plane, r + output_row, c + output_col, ch);
+                    ncplane_putchar_yx(run_plane, r + 1, c + 1, ch);
                     c++;
                 }
             }
-            r++;
         }
 
-        // Bottom bar
-        std::string scroll_info;
-        if (total > vis_rows)
-            scroll_info += " Ln " + std::to_string(scroll_top + 1) + "/" + std::to_string(total);
-        if (scroll_left > 0)
-            scroll_info += " Col " + std::to_string(scroll_left + 1);
-        if (!scroll_info.empty()) scroll_info += " ";
-        std::string bar = scroll_info + bottom_text;
-        ncplane_set_fg_rgb(run_plane, 0xaaaaaa);
+        // ── Tape display (right column) ──
+        int tape_cells = vis_rows;
+        int mid = tape_cells / 2;
+        int first_cell = (cur_ptr < mid) ? 0 : cur_ptr - mid;
+
+        // Grey separator bar
         ncplane_set_bg_rgb(run_plane, 0x333333);
-        for (int x = 1; x < (int)term_x_u - 1; x++)
-            ncplane_putchar_yx(run_plane, (int)term_y_u - 1, x, ' ');
-        ncplane_putstr_yx(run_plane, (int)term_y_u - 1, 1, bar.c_str());
-        notcurses_render(nc);
-    };
+        ncplane_set_fg_rgb(run_plane, 0x333333);
+        for (int y = 0; y < vis_rows; y++)
+            ncplane_putchar_yx(run_plane, y + 1, tape_col - 1, ' ');
 
-    // Check if stdbuf is available for line-buffered streaming
-    static bool stdbuf_ok = false;
-    static bool stdbuf_checked = false;
-    if (!stdbuf_checked) {
-        stdbuf_checked = true;
-        struct stat st;
-        stdbuf_ok = (stat("/opt/homebrew/bin/stdbuf", &st) == 0) ||
-                    (stat("/usr/local/bin/stdbuf", &st) == 0) ||
-                    (stat("/usr/bin/stdbuf", &st) == 0);
-    }
+        // Tape header label
+        ncplane_set_bg_rgb(run_plane, 0x335577);
+        ncplane_set_fg_rgb(run_plane, 0xaaaaaa);
+        ncplane_putstr_yx(run_plane, 0, tape_col, " Cells");
 
-    for (auto& interp : interps) {
-        if (ran || aborted) break;
+        // Cell rows
+        for (int i = 0; i < tape_cells; i++) {
+            int idx = first_cell + i;
+            auto it = tape_snap.find(idx);
+            unsigned char val = (it != tape_snap.end()) ? it->second : 0;
+            bool is_cur = (idx == cur_ptr);
+            bool nz = (val != 0);
 
-        const char* argv_list[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
-        int ai = 0;
-        if (stdbuf_ok) {
-            argv_list[ai++] = "stdbuf";
-            argv_list[ai++] = "-oL";
-        }
-        argv_list[ai++] = interp.cmd.c_str();
-        if (!interp.arg.empty()) argv_list[ai++] = interp.arg.c_str();
-        argv_list[ai] = nullptr;
-
-        pid_t pid = fork();
-        if (pid == 0) {
-            // Child: redirect stdout+stderr to output.txt
-            int fd = open(output_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (fd >= 0) {
-                dup2(fd, STDOUT_FILENO);
-                dup2(fd, STDERR_FILENO);
-                close(fd);
+            if (is_cur) {
+                ncplane_set_bg_rgb(run_plane, 0x335577);
+                ncplane_set_fg_rgb(run_plane, 0xffffff);
+            } else {
+                ncplane_set_bg_rgb(run_plane, 0x111111);
+                ncplane_set_fg_rgb(run_plane, nz ? 0xcccccc : 0x555555);
             }
-            execvp(argv_list[0], const_cast<char**>(argv_list));
-            _exit(127);
-        } else if (pid > 0) {
-            // Parent: poll output.txt + keyboard until child exits
-            int status = 0;
-            captured_output.clear();
+            char buf[16];
+            snprintf(buf, 16, is_cur ? ">[%3d]:%s" : " [%3d]:%s", (int)val, ascii_label(val));
+            ncplane_putstr_yx(run_plane, i + 1, tape_col, buf);
+        }
 
-            while (true) {
-                // Read output.txt and display
+        // ── Status bar ──
+        std::string status;
+        if (has_error)
+            status = " ERROR: " + err_msg + " ";
+        else if (finished)
+            status = " Finished ";
+        else if (input_needed)
+            status = " Input ";
+        else
+            status = " Running ";
+
+        std::string hints;
+        if (has_error)            hints = " any key close ";
+        else if (finished)        hints = " Q/Esc close  arrows scroll ";
+        else if (input_needed)    hints = " Esc=cancel ";
+        else {
+            int wm; bool paus;
+            { std::lock_guard<std::mutex> lk(state.mtx); wm = state.wait_ms; paus = state.paused; }
+            if (paus) status += "PAUSED ";
+            status += std::to_string(wm) + "ms ";
+            hints = " Q=abort  g=pause  h=undo  l=redo  j/k=speed  arrows=scroll ";
+        }
+
+        ncplane_set_bg_rgb(run_plane, 0x333333);
+        ncplane_set_fg_rgb(run_plane, 0xaaaaaa);
+        for (int x = 0; x < (int)term_x; x++)
+            ncplane_putchar_yx(run_plane, (int)term_y - 1, x, ' ');
+        ncplane_putstr_yx(run_plane, (int)term_y - 1, 1, (status + hints).c_str());
+
+        std::string lc = " Ln" + std::to_string(scroll_top + 1) + " Col" + std::to_string(scroll_left + 1);
+        ncplane_putstr_yx(run_plane, (int)term_y - 1,
+            (int)term_x - (int)lc.size() - 1, lc.c_str());
+
+        notcurses_render(nc);
+
+        // ── Input handling ──
+        if (input_needed) {
+            // ── Input dialog (multi-key, Enter submits) ──
+            unsigned int iy, ix;
+            notcurses_term_dim_yx(nc, &iy, &ix);
+            int box_h = 6, box_w = 50;
+            int by0 = ((int)iy - box_h) / 2;
+            int bx0 = ((int)ix - box_w) / 2;
+            if (by0 < 0) by0 = 0; if (bx0 < 0) bx0 = 0;
+
+            struct ncplane_options nopts = {};
+            nopts.y = by0; nopts.x = bx0;
+            nopts.rows = box_h; nopts.cols = box_w;
+            struct ncplane* inp = ncplane_create(notcurses_stdplane(nc), &nopts);
+            uint64_t bgc = 0;
+            ncchannels_set_fg_rgb(&bgc, 0xe0e0e0);
+            ncchannels_set_bg_rgb(&bgc, 0x222222);
+            ncplane_set_base(inp, " ", 0, bgc);
+
+            std::string inp_text;
+            int icursor = 0;
+            bool inp_done = false, inp_cancel = false;
+            while (!inp_done && !inp_cancel) {
+                ncplane_erase(inp);
+                ncplane_set_bg_rgb(inp, 0x335577);
+                ncplane_set_fg_rgb(inp, 0xffffff);
+                ncplane_putstr_yx(inp, 0, 1, " Program Input " );
+                for (int x = 16; x < box_w - 1; x++)
+                    ncplane_putchar_yx(inp, 0, x, ' ');
+
+                ncplane_set_fg_rgb(inp, 0xcccccc);
+                ncplane_set_bg_rgb(inp, 0x111111);
+                std::string disp = inp_text;
+                int dw = box_w - 4;
+                int scroll_off = 0;
+                if ((int)disp.size() > dw) {
+                    // Scroll to keep cursor visible
+                    if (icursor <= dw / 2)
+                        scroll_off = 0;
+                    else if (icursor >= (int)disp.size() - dw / 2)
+                        scroll_off = (int)disp.size() - dw;
+                    else
+                        scroll_off = icursor - dw / 2;
+                    if (scroll_off < 0) scroll_off = 0;
+                    if (scroll_off > (int)disp.size() - dw) scroll_off = (int)disp.size() - dw;
+                    disp = disp.substr(scroll_off, dw);
+                }
+                ncplane_putstr_yx(inp, 2, 2, disp.c_str());
+
+                // Draw cursor at correct position
+                int cvis = icursor - scroll_off;
+                if (cvis >= 0 && cvis < dw) {
+                    ncplane_set_fg_rgb(inp, 0x000000);
+                    ncplane_set_bg_rgb(inp, 0x44aaff);
+                    ncplane_putchar_yx(inp, 2, 2 + cvis,
+                        cvis < (int)disp.size() ? disp[cvis] : ' ');
+                }
+
+                // Bottom bar — fill full width (same logic as header)
+                ncplane_set_fg_rgb(inp, 0xaaaaaa);
+                ncplane_set_bg_rgb(inp, 0x333333);
+                ncplane_putstr_yx(inp, box_h-1, 1, " Enter=submit  \x18/\x19 cursor  Esc=cancel ");
+                for (int x = 39; x < box_w - 1; x++)
+                    ncplane_putchar_yx(inp, box_h-1, x, ' ');
+
+                // Check if program finished while dialog was open
                 {
-                    std::ifstream f(output_path);
-                    if (f) {
-                        captured_output = std::string(
-                            (std::istreambuf_iterator<char>(f)),
-                            std::istreambuf_iterator<char>());
-                    }
-                }
-                render_output(" Running... Q=abort \x18/\x19/jk \xe2\x86\x90/\xe2\x86\x92/hl ");
-
-                // Check keyboard (non-blocking)
-                struct ncinput ni;
-                uint32_t k = notcurses_get_nblock(nc, &ni);
-                if (k != 0) {
-                    if (ni.id == 'q' || ni.id == 'Q') {
-                        kill(pid, SIGKILL);
-                        waitpid(pid, &status, 0);
-                        captured_output += "\n[Aborted by user (Q)]\n";
-                        aborted = true;
-                        break;
-                    }
-                    int total = count_lines();
-                    int vis = (int)term_y_u - output_row - 1;
-                    if (k == NCKEY_UP || ni.id == 'k') { if (scroll_top > 0) scroll_top--; }
-                    else if (k == NCKEY_DOWN || ni.id == 'j') { if (scroll_top < total - vis) scroll_top++; }
-                    else if (k == NCKEY_LEFT || ni.id == 'h') { if (scroll_left > 0) scroll_left -= 4; if (scroll_left < 0) scroll_left = 0; }
-                    else if (k == NCKEY_RIGHT || ni.id == 'l') { scroll_left += 4; }
+                    std::lock_guard<std::mutex> lk(state.mtx);
+                    if (!state.running) break;
                 }
 
-                // Check child exit
-                pid_t w = waitpid(pid, &status, WNOHANG);
-                if (w == pid) {
-                    // One last read of output.txt
-                    std::ifstream f(output_path);
-                    if (f) {
-                        captured_output = std::string(
-                            (std::istreambuf_iterator<char>(f)),
-                            std::istreambuf_iterator<char>());
-                    }
-                    break;
-                }
+                notcurses_render(nc);
 
-                struct timespec ts = { .tv_sec = 0, .tv_nsec = 50000000 }; // 50ms
-                nanosleep(&ts, nullptr);
+                struct ncinput ni2;
+                uint32_t k2 = notcurses_get_nblock(nc, &ni2);
+                if (k2 == 0) {
+                    struct timespec ts = { .tv_sec = 0, .tv_nsec = 16600000 };
+                    nanosleep(&ts, nullptr);
+                    continue;
+                }
+                if (k2 == NCKEY_ESC) inp_cancel = true;
+                else if (k2 == NCKEY_ENTER || ni2.id == '\n' || ni2.id == '\r') {
+                    // Insert newline at cursor (like stdio), flush to interpreter, keep dialog open
+                    inp_text.insert(inp_text.begin() + icursor, '\n');
+                    icursor++;
+                    // Flush accumulated input to interpreter
+                    {
+                        std::lock_guard<std::mutex> lk(state.mtx);
+                        state.input_buffer += inp_text;
+                        state.input_done = true;
+                    }
+                    state.cv.notify_one();
+                    inp_text.clear();
+                    icursor = 0;
+                } else if (k2 == NCKEY_BACKSPACE || ni2.id == 0x7f) {
+                    if (icursor > 0) {
+                        inp_text.erase(icursor - 1, 1);
+                        icursor--;
+                    }
+                } else if (k2 == NCKEY_LEFT || ni2.id == '\x1b[D') {
+                    // Left arrow via ni2.id check — NCKEY_LEFT should also work
+                    if (icursor > 0) icursor--;
+                } else if (k2 == NCKEY_RIGHT) {
+                    if (icursor < (int)inp_text.size()) icursor++;
+                } else if (ni2.id >= 32 && ni2.id < 127) {
+                    inp_text.insert(inp_text.begin() + icursor, (char)ni2.id);
+                    icursor++;
+                }
             }
+            ncplane_destroy(inp);
+            notcurses_render(nc);
 
-            if (aborted) { ran = true; break; }
-
-            if (WIFEXITED(status)) {
-                int ec = WEXITSTATUS(status);
-                if (ec == 127) {
-                    captured_output.clear();
-                    continue; // try next interpreter
-                }
-                ran = true;
-                if (ec != 0)
-                    captured_output += "\n[Exit code: " + std::to_string(ec) + "]\n";
-            } else if (WIFSIGNALED(status)) {
-                captured_output += "\n[Killed by signal " + std::to_string(WTERMSIG(status)) + "]\n";
-                ran = true;
-            }
-        }
-    }
-
-    // ── Final display ──────────────────────────────────────────────
-    if (!ran && !aborted && captured_output.empty()) {
-        ncplane_set_fg_rgb(run_plane, 0xff4444);
-        ncplane_putstr_yx(run_plane, output_row, output_col, "All interpreters failed!");
-        notcurses_render(nc);
-        struct timespec ts = { .tv_sec = 2, .tv_nsec = 0 };
-        nanosleep(&ts, nullptr);
-    } else {
-        bool done = false;
-        while (!done) {
-            render_output(" Esc|Q=close  \x18/\x19/jk \xe2\x86\x90/\xe2\x86\x92/hl ");
-            struct ncinput ni;
-            uint32_t k = notcurses_get_blocking(nc, &ni);
-            if (k == NCKEY_ESC || ni.id == 'q' || ni.id == 'Q') {
+            if (inp_cancel) {
+                { std::lock_guard<std::mutex> lk(state.mtx); state.running = false; }
+                state.cv.notify_one();
                 done = true;
-            } else            if (k == NCKEY_UP || ni.id == 'k') {
-                if (scroll_top > 0) scroll_top--;
-            } else if (k == NCKEY_DOWN || ni.id == 'j') {
-                int vis = (int)term_y_u - output_row - 1;
-                int total = count_lines();
-                if (scroll_top < total - vis) scroll_top++;
-            } else if (k == NCKEY_LEFT || ni.id == 'h') {
-                if (scroll_left > 0) scroll_left -= 4;
-                if (scroll_left < 0) scroll_left = 0;
-            } else if (k == NCKEY_RIGHT || ni.id == 'l') {
-                scroll_left += 4;
+            } else {
+                { std::lock_guard<std::mutex> lk(state.mtx);
+                  state.input_buffer = inp_text;
+                  state.input_done = true; }
+                state.cv.notify_one();
             }
+        } else if (has_error) {
+            struct ncinput ni;
+            notcurses_get_blocking(nc, &ni);
+            done = true;
+        } else if (!finished) {
+            struct ncinput ni;
+            uint32_t k = notcurses_get_nblock(nc, &ni);
+            if (k == NCKEY_ESC || ni.id == 'q' || ni.id == 'Q') {
+                { std::lock_guard<std::mutex> lk(state.mtx); state.running = false; }
+                state.cv.notify_one();
+                done = true;
+            }
+            auto adj_speed = [&](int dir) {
+                int wm = state.wait_ms;
+                int step = wm < 10 ? 1 : wm < 20 ? 5 : wm < 200 ? 10 : wm < 500 ? 50 : 100;
+                int w = state.wait_ms + dir * step;
+                if (w < 0) w = 0;
+                if (w > 1000) w = 1000;
+                state.wait_ms = w;
+            };
+            // Debug/undo keys
+            auto undo_step = [&]() {
+                std::lock_guard<std::mutex> lk(state.mtx);
+                if (state.history.empty()) return;
+                if (display_pos == -1) {
+                    display_pos = (int)state.history.size() - 2;
+                    display_tape.clear(); display_ptr = 0;
+                    for (int i = 0; i <= display_pos; i++) {
+                        auto& e = state.history[i];
+                        if (e.cell >= 0) display_tape[e.cell] = e.new_val;
+                        display_ptr = e.ptr;
+                    }
+                } else if (display_pos > 0) {
+                    auto& e = state.history[display_pos];
+                    if (e.cell >= 0) display_tape[e.cell] = e.old_val;
+                    display_ptr = e.ptr;
+                    display_pos--;
+                }
+            };
+            auto redo_step = [&]() {
+                if (display_pos == -1) return;
+                display_pos++;
+                if (display_pos >= (int)state.history.size() - 1) {
+                    display_pos = -1;
+                } else {
+                    auto& e = state.history[display_pos];
+                    if (e.cell >= 0) display_tape[e.cell] = e.new_val;
+                    display_ptr = e.ptr;
+                }
+            };
+            if (ni.id == 'g') {
+                state.paused = !state.paused;
+                if (state.paused) { std::lock_guard<std::mutex> lk(state.mtx); state.recording = true; }
+                if (!state.paused) state.cv.notify_one();
+            }
+            if (ni.id == 'h') {
+                { std::lock_guard<std::mutex> lk(state.mtx); state.recording = true; }
+                undo_step();
+            }
+            if (ni.id == 'l') redo_step();
+            if (ni.id == 'k')      adj_speed(1);
+            else if (ni.id == 'j')  adj_speed(-1);
+            if (k == NCKEY_UP) { scroll_top = std::max(0, scroll_top - 1); follow_bottom = false; }
+            else if (k == NCKEY_DOWN) { scroll_top++; if (scroll_top >= max_scroll_v) follow_bottom = true; }
+            else if (k == NCKEY_LEFT) scroll_left = std::max(0, scroll_left - 4);
+            else if (k == NCKEY_RIGHT) scroll_left += 4;
+            struct timespec ts = {.tv_sec = 0, .tv_nsec = 33000000};
+            nanosleep(&ts, nullptr);
+        } else {
+            struct ncinput ni;
+            uint32_t k = notcurses_get_nblock(nc, &ni);
+            if (k == NCKEY_ESC || ni.id == 'q' || ni.id == 'Q') done = true;
+            auto adj_speed = [&](int dir) {
+                int wm = state.wait_ms;
+                int step = wm < 10 ? 1 : wm < 20 ? 5 : wm < 200 ? 10 : wm < 500 ? 50 : 100;
+                int w = state.wait_ms + dir * step;
+                if (w < 0) w = 0;
+                if (w > 1000) w = 1000;
+                state.wait_ms = w;
+            };
+            auto undo_step = [&]() {
+                std::lock_guard<std::mutex> lk(state.mtx);
+                if (state.history.empty()) return;
+                if (display_pos == -1) {
+                    display_pos = (int)state.history.size() - 2;
+                    display_tape.clear(); display_ptr = 0;
+                    for (int i = 0; i <= display_pos; i++) {
+                        auto& e = state.history[i];
+                        if (e.cell >= 0) display_tape[e.cell] = e.new_val;
+                        display_ptr = e.ptr;
+                    }
+                } else if (display_pos > 0) {
+                    auto& e = state.history[display_pos];
+                    if (e.cell >= 0) display_tape[e.cell] = e.old_val;
+                    display_ptr = e.ptr;
+                    display_pos--;
+                }
+            };
+            auto redo_step = [&]() {
+                if (display_pos == -1) return;
+                display_pos++;
+                if (display_pos >= (int)state.history.size() - 1) {
+                    display_pos = -1;
+                } else {
+                    auto& e = state.history[display_pos];
+                    if (e.cell >= 0) display_tape[e.cell] = e.new_val;
+                    display_ptr = e.ptr;
+                }
+            };
+            if (ni.id == 'g') {
+                state.paused = !state.paused;
+                if (state.paused) { std::lock_guard<std::mutex> lk(state.mtx); state.recording = true; }
+                if (!state.paused) state.cv.notify_one();
+            }
+            if (ni.id == 'h') {
+                { std::lock_guard<std::mutex> lk(state.mtx); state.recording = true; }
+                undo_step();
+            }
+            if (ni.id == 'l') redo_step();
+            if (ni.id == 'k')      adj_speed(1);
+            else if (ni.id == 'j')  adj_speed(-1);
+            if (k == NCKEY_UP) { scroll_top = std::max(0, scroll_top - 1); follow_bottom = false; }
+            else if (k == NCKEY_DOWN) { scroll_top++; if (scroll_top >= max_scroll_v) follow_bottom = true; }
+            else if (k == NCKEY_LEFT) scroll_left = std::max(0, scroll_left - 4);
+            else if (k == NCKEY_RIGHT) scroll_left += 4;
+            struct timespec ts = {.tv_sec = 0, .tv_nsec = 33000000};
+            nanosleep(&ts, nullptr);
         }
     }
+
+    // ── Cleanup ──
+    {
+        std::lock_guard<std::mutex> lk(state.mtx);
+        state.running = false;
+    }
+    state.cv.notify_one();
+    if (interp.joinable()) interp.join();
 
     ncplane_destroy(run_plane);
     notcurses_render(nc);
@@ -598,6 +939,7 @@ static void editor_loop(notcurses* nc) {
     std::string buffer;
     int cursor = 0;
     int scroll_row = 0;
+    int scroll_col = 0;
     bool code_mode = true;
     std::string current_file;
     bool quit = false;
@@ -698,10 +1040,14 @@ static void editor_loop(notcurses* nc) {
             }
         }
 
-        // Adjust scroll
+        // Adjust vertical scroll
         if (cursor_line < scroll_row) scroll_row = cursor_line;
         if (cursor_line >= scroll_row + max_rows) scroll_row = cursor_line - max_rows + 1;
         if (scroll_row < 0) scroll_row = 0;
+        // Adjust horizontal scroll
+        if (cursor_col < scroll_col) scroll_col = cursor_col;
+        if (cursor_col >= scroll_col + max_cols) scroll_col = cursor_col - max_cols + 1;
+        if (scroll_col < 0) scroll_col = 0;
 
         // Draw visible lines
         for (int row = 0; row < max_rows; row++) {
@@ -714,8 +1060,9 @@ static void editor_loop(notcurses* nc) {
                         : (int)buffer.size();
 
             int col;
+            int vis_col = cursor_col - scroll_col;
             for (col = 0; col < max_cols; col++) {
-                int pos = start + col;
+                int pos = start + scroll_col + col;
                 if (pos >= end) break;
 
                 char c = buffer[pos];
@@ -739,9 +1086,9 @@ static void editor_loop(notcurses* nc) {
                 ncplane_putchar_yx(edplane, row, col, c);
             }
 
-            // Cursor at end of line
-            int line_cursor = start + (end - start);
-            if (line_cursor == cursor && col < max_cols) {
+            // Cursor at end of line (only if visible)
+            int line_end_pos = start + (end - start);
+            if (line_end_pos == cursor && vis_col >= 0 && vis_col < max_cols) {
                 if (code_mode) {
                     ncplane_set_fg_rgb(edplane, 0x000000);
                     ncplane_set_bg_rgb(edplane, 0xffaa00);
@@ -749,7 +1096,7 @@ static void editor_loop(notcurses* nc) {
                     ncplane_set_fg_rgb(edplane, 0x000000);
                     ncplane_set_bg_rgb(edplane, 0x44aaff);
                 }
-                ncplane_putchar_yx(edplane, row, col, ' ');
+                ncplane_putchar_yx(edplane, row, vis_col, ' ');
             }
         }
 
@@ -760,8 +1107,8 @@ static void editor_loop(notcurses* nc) {
         if (code_mode)
             keymap_str = " ,[<-+>].  a:, s:[ d:< f:-  h:+ j:> k:] l:. ";
         std::string hints = " F1:Save F2:Open F3:Mode F4:Quit F5:Run ";
-        std::string lc = " Ln " + std::to_string(cursor_line + 1) +
-                         " Col " + std::to_string(cursor_col + 1);
+        std::string lc = " Ln" + std::to_string(cursor_line + 1) +
+                         " Col" + std::to_string(cursor_col + 1);
 
         // Check if everything fits on one row
         std::string line1_content = mode_tag + " " + fn_tag;
@@ -901,16 +1248,24 @@ static void editor_loop(notcurses* nc) {
             || (key == NCKEY_F02)) {
             std::string fn;
             if (file_browser_ui(nc, edplane, programs_dir, fn)) {
-                std::string path = programs_dir + "/" + fn;
-                std::ifstream f(path);
-                if (f) {
-                    buffer = std::string(
-                        (std::istreambuf_iterator<char>(f)),
-                        std::istreambuf_iterator<char>()
-                    );
+                if (fn.empty()) {
+                    // New file
+                    buffer.clear();
                     cursor = 0;
                     scroll_row = 0;
-                    current_file = fn;
+                    current_file.clear();
+                } else {
+                    std::string path = programs_dir + "/" + fn;
+                    std::ifstream f(path);
+                    if (f) {
+                        buffer = std::string(
+                            (std::istreambuf_iterator<char>(f)),
+                            std::istreambuf_iterator<char>()
+                        );
+                        cursor = 0;
+                        scroll_row = 0;
+                        current_file = fn;
+                    }
                 }
             }
             continue;
@@ -941,50 +1296,59 @@ static void editor_loop(notcurses* nc) {
             continue;
         }
         if (key == NCKEY_RIGHT) {
-            if (cursor < (int)buffer.size()) cursor++;
+            // Don't advance into newline character
+            if (cursor < (int)buffer.size() && buffer[cursor] != '\n') cursor++;
             continue;
         }
         if (key == NCKEY_UP) {
             // Move cursor up one line
-            // Find start of current line
             int line_start = cursor;
             while (line_start > 0 && buffer[line_start - 1] != '\n') line_start--;
             int col = cursor - line_start;
 
-            // Find start of previous line (if any)
             if (line_start > 0) {
-                int prev_end = line_start - 1; // position of the \n
+                int prev_end = line_start - 1;
                 int prev_start = prev_end;
                 while (prev_start > 0 && buffer[prev_start - 1] != '\n') prev_start--;
-                // col stays same, but clamped to prev line length
+                // If cursor was past prev line end, clamp; if was on \n, go to end-1
                 int new_pos = prev_start + col;
+                if (new_pos >= prev_end) new_pos = prev_end > prev_start ? prev_end : prev_end;
                 if (new_pos > prev_end) new_pos = prev_end;
                 cursor = new_pos;
             }
             continue;
         }
         if (key == NCKEY_DOWN) {
-            // Move cursor down one line
-            // Find start and end of current line
             int line_start = cursor;
             while (line_start > 0 && buffer[line_start - 1] != '\n') line_start--;
             int col = cursor - line_start;
 
-            // Find end of current line (position of \n or end of buffer)
             int line_end = cursor;
             while (line_end < (int)buffer.size() && buffer[line_end] != '\n') line_end++;
 
-            // If there's a next line
             if (line_end < (int)buffer.size()) {
                 int next_start = line_end + 1;
-                // Find end of next line
                 int next_end = next_start;
                 while (next_end < (int)buffer.size() && buffer[next_end] != '\n') next_end++;
-                // Clamp column to next line length
                 int new_pos = next_start + col;
                 if (new_pos > next_end) new_pos = next_end;
                 cursor = new_pos;
             }
+            continue;
+        }
+        if (key == NCKEY_PGUP) {
+            int new_scroll = scroll_row - max_rows;
+            if (new_scroll < 0) new_scroll = 0;
+            scroll_row = new_scroll;
+            cursor = line_starts[scroll_row];
+            continue;
+        }
+        if (key == NCKEY_PGDOWN) {
+            int target_scroll = scroll_row + max_rows;
+            if (target_scroll >= (int)line_starts.size()) target_scroll = (int)line_starts.size() - 1;
+            if (target_scroll < 0) target_scroll = 0;
+            scroll_row = target_scroll;
+            cursor = line_starts[scroll_row];
             continue;
         }
         if (key == NCKEY_HOME) {

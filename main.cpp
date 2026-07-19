@@ -64,7 +64,7 @@ int main(int argc, char* argv[]) {
 
         if (c == '>') {
             p++;
-        } else if (c == '<' && p > 0) {
+        } else if (c == '<') {
             p--;
         } else if (c == '+') {
             tape[p]++;
@@ -73,9 +73,8 @@ int main(int argc, char* argv[]) {
         } else if (c == '.') {
             std::cout << static_cast<char>(tape[p]);
         } else if (c == ',') {
-            char input;
-            std::cin >> input;
-            tape[p] = input;
+            int ch = getchar();
+            tape[p] = (ch == EOF) ? 0 : (unsigned char)ch;
         } else if (c == '[' && tape[p] == 0) {
             ip = jumps[ip];
         } else if (c == ']' && tape[p] != 0) {

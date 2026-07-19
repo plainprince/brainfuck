@@ -1,0 +1,13 @@
+# Compiled binaries
+bfs
+bff
+bfw
+bfc
+editor
+
+# Generated/transient files
+**.bf.out
+output.txt
+
+# OS files
+.DS_Store
