@@ -238,9 +238,9 @@ static void generate_ir(const std::vector<Op>& ops,
     for (int i = 0; i <= n; i++)
         bb[i] = BasicBlock::Create(ctx, "bb" + std::to_string(i), func);
 
-    // Exit block returns void
+    // Exit block returns 0
     b.SetInsertPoint(bb[n]);
-    b.CreateRetVoid();
+    b.CreateRet(ConstantInt::get(Type::getInt32Ty(ctx), 0));
 
     // Entry block branches to first real block
     b.SetInsertPoint(entry);
@@ -504,7 +504,7 @@ static void jit_execute(std::unique_ptr<Module> mod, std::unique_ptr<LLVMContext
     auto J = ExitOnErr(LLJITBuilder().create());
     ExitOnErr(J->addIRModule(ThreadSafeModule(std::move(mod), std::move(ctx))));
     auto addr = ExitOnErr(J->lookup("main"));
-    auto* bf_main = addr.toPtr<void()>();
+    auto* bf_main = addr.toPtr<int()>();
     bf_main();
     putchar('\n');
 }
@@ -561,7 +561,7 @@ int main(int argc, char* argv[]) {
     // Phase 3: Generate LLVM IR
     auto ctx = std::make_unique<LLVMContext>();
     auto mod = std::make_unique<Module>("bf_module", *ctx);
-    auto* funcTy = FunctionType::get(Type::getVoidTy(*ctx), false);
+    auto* funcTy = FunctionType::get(Type::getInt32Ty(*ctx), false);
     auto* func = Function::Create(funcTy, Function::ExternalLinkage, "main", *mod);
 
     generate_ir(ops, *ctx, *mod, func);
