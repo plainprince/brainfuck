@@ -540,7 +540,7 @@ static void run_program(notcurses* nc, struct ncplane* plane,
             { std::lock_guard<std::mutex> lk(state.mtx); wm = state.wait_ms; paus = state.paused; }
             if (paus) status += "PAUSED ";
             status += std::to_string(wm) + "ms ";
-            hints = " Q=abort  g=pause  h=undo  l=redo  j/k=speed  arrows=scroll ";
+            hints = " Q=abort  g=pause  j/k=undo/redo  arrows=scroll ";
         }
 
         ncplane_set_bg_rgb(run_plane, 0x333333);
@@ -654,8 +654,7 @@ static void run_program(notcurses* nc, struct ncplane* plane,
                         inp_text.erase(icursor - 1, 1);
                         icursor--;
                     }
-                } else if (k2 == NCKEY_LEFT || ni2.id == '\x1b[D') {
-                    // Left arrow via ni2.id check — NCKEY_LEFT should also work
+                } else if (k2 == NCKEY_LEFT) {
                     if (icursor > 0) icursor--;
                 } else if (k2 == NCKEY_RIGHT) {
                     if (icursor < (int)inp_text.size()) icursor++;
@@ -732,13 +731,13 @@ static void run_program(notcurses* nc, struct ncplane* plane,
                 if (state.paused) { std::lock_guard<std::mutex> lk(state.mtx); state.recording = true; }
                 if (!state.paused) state.cv.notify_one();
             }
-            if (ni.id == 'h') {
-                { std::lock_guard<std::mutex> lk(state.mtx); state.recording = true; }
-                undo_step();
+            if (state.paused) {
+                if (ni.id == 'j') { state.recording = true; undo_step(); }
+                else if (ni.id == 'k') redo_step();
+            } else {
+                if (ni.id == 'k')      adj_speed(1);
+                else if (ni.id == 'j')  adj_speed(-1);
             }
-            if (ni.id == 'l') redo_step();
-            if (ni.id == 'k')      adj_speed(1);
-            else if (ni.id == 'j')  adj_speed(-1);
             if (k == NCKEY_UP) { scroll_top = std::max(0, scroll_top - 1); follow_bottom = false; }
             else if (k == NCKEY_DOWN) { scroll_top++; if (scroll_top >= max_scroll_v) follow_bottom = true; }
             else if (k == NCKEY_LEFT) scroll_left = std::max(0, scroll_left - 4);
@@ -791,13 +790,13 @@ static void run_program(notcurses* nc, struct ncplane* plane,
                 if (state.paused) { std::lock_guard<std::mutex> lk(state.mtx); state.recording = true; }
                 if (!state.paused) state.cv.notify_one();
             }
-            if (ni.id == 'h') {
-                { std::lock_guard<std::mutex> lk(state.mtx); state.recording = true; }
-                undo_step();
+            if (state.paused) {
+                if (ni.id == 'j') { state.recording = true; undo_step(); }
+                else if (ni.id == 'k') redo_step();
+            } else {
+                if (ni.id == 'k')      adj_speed(1);
+                else if (ni.id == 'j')  adj_speed(-1);
             }
-            if (ni.id == 'l') redo_step();
-            if (ni.id == 'k')      adj_speed(1);
-            else if (ni.id == 'j')  adj_speed(-1);
             if (k == NCKEY_UP) { scroll_top = std::max(0, scroll_top - 1); follow_bottom = false; }
             else if (k == NCKEY_DOWN) { scroll_top++; if (scroll_top >= max_scroll_v) follow_bottom = true; }
             else if (k == NCKEY_LEFT) scroll_left = std::max(0, scroll_left - 4);
