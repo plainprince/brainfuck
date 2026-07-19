@@ -540,7 +540,8 @@ static void run_program(notcurses* nc, struct ncplane* plane,
             { std::lock_guard<std::mutex> lk(state.mtx); wm = state.wait_ms; paus = state.paused; }
             if (paus) status += "PAUSED ";
             status += std::to_string(wm) + "ms ";
-            hints = " Q=abort  g=pause  j/k=undo/redo  arrows=scroll ";
+            hints = paus ? " Q=abort  g=unpause  j/k=undo/redo  arrows=scroll "
+                    : " Q=abort  g=pause  j/k=slower/faster  arrows=scroll ";
         }
 
         ncplane_set_bg_rgb(run_plane, 0x333333);
