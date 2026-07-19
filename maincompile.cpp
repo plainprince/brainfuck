@@ -511,11 +511,12 @@ static void jit_execute(std::unique_ptr<Module> mod, std::unique_ptr<LLVMContext
 
 // ── Print help ──────────────────────────────────────────────────────
 static void print_help(const char* prog) {
-    fprintf(stderr, "Usage: %s <file.bf> [run]\n", prog);
+    fprintf(stderr, "Usage: %s <file.bf> [run] [--fast | -f]\n", prog);
     fprintf(stderr, "  LLVM JIT compiler for brainfuck.\n");
     fprintf(stderr, "\n");
-    fprintf(stderr, "  Without 'run': compiles to <file>.out (linked executable)\n");
-    fprintf(stderr, "  With 'run':    compiles and JIT-executes immediately\n");
+    fprintf(stderr, "  Without 'run':  compiles to <file>.out (linked executable)\n");
+    fprintf(stderr, "  With 'run':     JIT-executes (pre-optimizes by default)\n");
+    fprintf(stderr, "    --fast, -f      skip IR optimization for faster startup\n");
 }
 
 // ── Main ────────────────────────────────────────────────────────────
@@ -525,10 +526,12 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    bool do_run = false;
+    bool do_run = false, fast = false;
     const char* filepath = argv[1];
-    if (argc >= 3 && strcmp(argv[2], "run") == 0)
-        do_run = true;
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "run") == 0) do_run = true;
+        else if (strcmp(argv[i], "--fast") == 0 || strcmp(argv[i], "-f") == 0) fast = true;
+    }
 
     InitializeNativeTarget();
     InitializeNativeTargetAsmPrinter();
@@ -571,13 +574,12 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "error: IR verification failed\n"); return 1;
     }
 
-    // Phase 4: Optimize
-    optimize_module(*mod);
-
     if (do_run) {
-        // Phase 5: JIT execute
+        if (!fast) optimize_module(*mod);
         jit_execute(std::move(mod), std::move(ctx));
     } else {
+        // Phase 4: Optimize (explicit — needed for AOT codegen)
+        optimize_module(*mod);
         // Phase 5: Compile to executable
         std::string out_path = std::string(filepath) + ".out";
         if (!compile_to_executable(*mod, out_path)) return 1;
