@@ -743,6 +743,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    setvbuf(stdout, NULL, _IONBF, 0);
+
     const char* filepath = argv[1];
     int fd = open(filepath, O_RDONLY);
     if (fd < 0) {

@@ -22,11 +22,11 @@ Four progressively optimized C++ brainfuck interpreters/compilers and a TUI edit
 ## Architecture
 
 ```
-main.cpp          → bfs, bff    (direct interpretation)
-mainfast.cpp      → bfw         (custom bytecode compiler + VM)
-maincompile.cpp   → bfc         (LLVM IR → JIT compiler)
-editor.cpp        → editor      (TUI editor via notcurses)
-main.js           → node/bun    (JS reference)
+main.cpp          → bfs, bff     (direct interpretation)
+mainfast.cpp      → bfw     (custom bytecode compiler + VM)
+maincompile.cpp   → bfc          (LLVM IR → JIT compiler)
+editor.cpp        → editor       (TUI editor via notcurses)
+main.js           → node/bun     (JS reference)
 ```
 
 ---
@@ -109,6 +109,7 @@ clang++ -O3 -march=native -flto mainfast.cpp -o bfw
 | **Requires** | LLVM 22 (`brew install llvm`) |
 | **Usage** | `./bfc <file.bf>` — compiles to `<file.bf>.out` (Mach-O object) |
 | | `./bfc <file.bf> run` — compiles and JIT-executes immediately |
+| | `./bfc <file.bf> run --fast` or `./bfc <file.bf> run -f` — skip LLVM optimization for faster startup |
 
 Compiles brainfuck to LLVM IR and JIT-executes it via LLVM's ORC JIT v2. Applies the same idiom detection as bfw before IR generation, then delegates further optimization to LLVM's `-O2` pass pipeline.
 
@@ -147,9 +148,7 @@ Phase 5: JIT execution
 
 **Build:**
 ```bash
-g++ -std=c++17 -O3 maincompile.cpp \
-  $(/opt/homebrew/opt/llvm/bin/llvm-config --cxxflags --ldflags --libs core orcjit native) \
-  -o bfc
+clang++ -std=c++17 -O3 maincompile.cpp $(/opt/homebrew/opt/llvm/bin/llvm-config --cxxflags --ldflags --libs core orcjit native) -o bfc
 ```
 
 **Running:**
@@ -215,14 +214,13 @@ clang++ -O3 main.cpp -o bff
 clang++ -O3 -march=native -flto mainfast.cpp -o bfw
 
 # LLVM JIT compiler (bfc)
-LLVM_CONFIG=/opt/homebrew/opt/llvm/bin/llvm-config
-g++ -std=c++17 -O3 maincompile.cpp \
-  $($LLVM_CONFIG --cxxflags --ldflags --libs core orcjit native) \
-  -o bfc
+clang++ -std=c++17 -O3 maincompile.cpp $(/opt/homebrew/opt/llvm/bin/llvm-config --cxxflags --ldflags --libs core orcjit native) -o bfc
 
 # TUI editor
 clang++ -std=c++17 -O2 editor.cpp \
-  $(pkg-config --cflags --libs notcurses) -o editor
+  -I/opt/homebrew/Cellar/notcurses/3.0.17/include \
+  -L/opt/homebrew/Cellar/notcurses/3.0.17/lib \
+  -lnotcurses -lnotcurses-core -o editor
 ```
 
 ### Running
@@ -259,6 +257,16 @@ hyperfine --warmup 1 --runs 5 \
 
 ---
 
+## Quick Builds
+
+```bash
+clang++ -std=c++17 -O3 main.cpp -o bfs
+clang++ -std=c++17 -O3 main.cpp -o bff
+clang++ -std=c++17 -O3 -march=native -flto mainfast.cpp -o bfw
+clang++ -std=c++17 -O3 maincompile.cpp $(/opt/homebrew/opt/llvm/bin/llvm-config --cxxflags --ldflags --libs core orcjit native) -o bfc
+clang++ -std=c++17 -O2 editor.cpp -I/opt/homebrew/Cellar/notcurses/3.0.17/include -L/opt/homebrew/Cellar/notcurses/3.0.17/lib -lnotcurses -lnotcurses-core -o editor
+```
+
 ## CLI Editor
 
 A terminal-based brainfuck editor built on [notcurses](https://github.com/dankamongmen/notcurses). Source: `editor.cpp`.
@@ -283,12 +291,12 @@ Reads/writes brainfuck files from `programs/`. For execution, saves to a temp fi
 
 ### Code Mode Mappings
 
-In **Code mode**, these keys insert brainfuck commands (same positional mapping across home row, top row, and number row):
+In **Code mode**, these keys insert brainfuck commands (same positional mapping across home row, top row, and number row). The mapping follows the pattern `,[<-+>].` laid out left-to-right:
 
 ```
-Home row: a=,  s=[  d=+  f=<   h=>  j=-  k=]  l=.
-Top row:  q=,  w=[  e=+  r=<   y=>  u=-  i=]  o=.
-Numbers:  1=,  2=[  3=+  4=<   5=>  6=-  7=]  8=.
+Home row: a=,  s=[  d=<  f=-   h=+  j=>  k=]  l=.
+Top row:  q=,  w=[  e=<  r=-   y=+  u=>  i=]  o=.
+Numbers:  1=,  2=[  3=<  4=-   5=+  6=>  7=]  8=.
 ```
 
 Direct brainfuck characters `[]+-<>.,` insert themselves. All other keys are ignored in code mode.

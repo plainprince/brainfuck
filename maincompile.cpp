@@ -223,6 +223,30 @@ static void generate_ir(const std::vector<Op>& ops,
     auto* ptr = b.CreateAlloca(Type::getInt32Ty(ctx), nullptr, "ptr");
     b.CreateStore(ConstantInt::get(Type::getInt32Ty(ctx), 0), ptr);
 
+    // Make stdout unbuffered for real-time output (AOT-compiled binaries)
+    {
+        auto* i8PtrTy = PointerType::get(ctx, 0);
+        auto* setbufTy = FunctionType::get(Type::getVoidTy(ctx),
+            {i8PtrTy, i8PtrTy}, false);
+        auto* setbufFn = Function::Create(setbufTy,
+            Function::ExternalLinkage, "setbuf", mod);
+
+        // On macOS, stdout is the symbol __stdoutp; on Linux it's stdout.
+        // Use the host platform's symbol at compile time.
+        const char* stdoutSym =
+#if defined(__APPLE__)
+            "__stdoutp";
+#else
+            "stdout";
+#endif
+        auto* stdoutVar = new GlobalVariable(mod, i8PtrTy, false,
+            GlobalValue::ExternalLinkage, nullptr, stdoutSym);
+
+        auto* stdoutVal = b.CreateLoad(i8PtrTy, stdoutVar, "stdout");
+        auto* nullPtr = ConstantPointerNull::get(i8PtrTy);
+        b.CreateCall(setbufFn, {stdoutVal, nullPtr});
+    }
+
     // Declare putchar / getchar
     auto* putcharTy = FunctionType::get(Type::getInt32Ty(ctx),
         {Type::getInt32Ty(ctx)}, false);
@@ -450,7 +474,7 @@ static bool compile_to_executable(Module& mod,
                                    const std::string& outPath) {
     auto targetTriple = Triple(sys::getDefaultTargetTriple());
     std::string error;
-    auto* target = TargetRegistry::lookupTarget(targetTriple.str(), error);
+    auto* target = TargetRegistry::lookupTarget(targetTriple, error);
     if (!target) {
         fprintf(stderr, "error: %s\n", error.c_str());
         return false;
@@ -505,6 +529,7 @@ static void jit_execute(std::unique_ptr<Module> mod, std::unique_ptr<LLVMContext
     ExitOnErr(J->addIRModule(ThreadSafeModule(std::move(mod), std::move(ctx))));
     auto addr = ExitOnErr(J->lookup("main"));
     auto* bf_main = addr.toPtr<int()>();
+    setvbuf(stdout, NULL, _IONBF, 0);
     bf_main();
     putchar('\n');
 }

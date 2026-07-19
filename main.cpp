@@ -54,6 +54,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    std::cout << std::unitbuf;
+
     int p = 0;
     int ip = 0;
 

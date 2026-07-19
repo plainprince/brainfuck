@@ -758,7 +758,7 @@ static void editor_loop(notcurses* nc) {
         std::string fn_tag = " " + (current_file.empty() ? "(unnamed)" : current_file) + " ";
         std::string keymap_str;
         if (code_mode)
-            keymap_str = " a:, s:[ d:+ f:<  h:> j:- k:] l:. ";
+            keymap_str = " ,[<-+>].  a:, s:[ d:< f:-  h:+ j:> k:] l:. ";
         std::string hints = " F1:Save F2:Open F3:Mode F4:Quit F5:Run ";
         std::string lc = " Ln " + std::to_string(cursor_line + 1) +
                          " Col " + std::to_string(cursor_col + 1);
@@ -1048,32 +1048,32 @@ static void editor_loop(notcurses* nc) {
         char to_insert = 0;
 
         if (code_mode) {
-            // ── Code mode mappings ────────────────────────────────
+            // ── Code mode mappings: , [ < - + > ] . ───────────────
             // Home row: a s d f   h j k l
             if      (ch == 'a' || ch == 'A') to_insert = ',';
             else if (ch == 's' || ch == 'S') to_insert = '[';
-            else if (ch == 'd' || ch == 'D') to_insert = '+';
-            else if (ch == 'f' || ch == 'F') to_insert = '<';
-            else if (ch == 'h' || ch == 'H') to_insert = '>';
-            else if (ch == 'j' || ch == 'J') to_insert = '-';
+            else if (ch == 'd' || ch == 'D') to_insert = '<';
+            else if (ch == 'f' || ch == 'F') to_insert = '-';
+            else if (ch == 'h' || ch == 'H') to_insert = '+';
+            else if (ch == 'j' || ch == 'J') to_insert = '>';
             else if (ch == 'k' || ch == 'K') to_insert = ']';
             else if (ch == 'l' || ch == 'L') to_insert = '.';
             // Top row (above home row): q w e r   y u i o
             else if (ch == 'q' || ch == 'Q') to_insert = ',';
             else if (ch == 'w' || ch == 'W') to_insert = '[';
-            else if (ch == 'e' || ch == 'E') to_insert = '+';
-            else if (ch == 'r' || ch == 'R') to_insert = '<';
-            else if (ch == 'y' || ch == 'Y') to_insert = '>';
-            else if (ch == 'u' || ch == 'U') to_insert = '-';
+            else if (ch == 'e' || ch == 'E') to_insert = '<';
+            else if (ch == 'r' || ch == 'R') to_insert = '-';
+            else if (ch == 'y' || ch == 'Y') to_insert = '+';
+            else if (ch == 'u' || ch == 'U') to_insert = '>';
             else if (ch == 'i' || ch == 'I') to_insert = ']';
             else if (ch == 'o' || ch == 'O') to_insert = '.';
             // Number row (same positional mapping): 1 2 3 4   5 6 7 8
             else if (ch == '1') to_insert = ',';
             else if (ch == '2') to_insert = '[';
-            else if (ch == '3') to_insert = '+';
-            else if (ch == '4') to_insert = '<';
-            else if (ch == '5') to_insert = '>';
-            else if (ch == '6') to_insert = '-';
+            else if (ch == '3') to_insert = '<';
+            else if (ch == '4') to_insert = '-';
+            else if (ch == '5') to_insert = '+';
+            else if (ch == '6') to_insert = '>';
             else if (ch == '7') to_insert = ']';
             else if (ch == '8') to_insert = '.';
             // Direct BF commands stay as-is
